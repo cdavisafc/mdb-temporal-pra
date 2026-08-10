@@ -70,6 +70,7 @@ pipeline/
 ├── seed.py                 ← Dev utility: upload a local file to MinIO
 ├── seed_repo.py            ← Dev utility: bulk-upload a markdown docs repo
 ├── cutover.py              ← Flip active collection pointer in temporal_config
+├── trigger_backfill.py     ← CLI: start BackfillWorkflow (re-embed active → green)
 ├── workflows/
 │   ├── ingest_workflow.py  ← IngestWorkflow: 3 stages, per-chunk checkpointing, parallel embed
 │   └── backfill_workflow.py← BackfillWorkflow: paginated re-embed with continue-as-new

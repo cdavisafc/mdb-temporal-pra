@@ -45,48 +45,22 @@ This PRA packages the pattern that removes that pain — already in production a
 
 ### High-level design
 
-```mermaid
-flowchart LR
-    src[("Data sources<br/>S3 / object store")]
-    user([User])
-    web[["Web"]]
-    voyage[["Voyage AI<br/>embeddings + rerank"]]
-    openai[["OpenAI<br/>agent model"]]
+![High-level architecture — Sources → Kafka → Temporal → Atlas → Deep Agent → User](docs/images/mongodb-temporal-hld-directtotemporal.png)
 
-    subgraph temporal["Temporal — durable compute"]
-      direction TB
-      ingest["Ingestion workflow<br/>chunk + embed"]
-      agent["Research agent<br/>durable loop"]
-    end
-
-    atlas[("MongoDB Atlas<br/>vector store + agent state")]
-
-    src -->|"object-created event"| ingest
-    ingest -.->|"embed"| voyage
-    ingest -->|"write vectors"| atlas
-
-    user -->|"question"| agent
-    agent -->|"answer"| user
-    agent -->|"vector search"| atlas
-    agent -.->|"rerank"| voyage
-    agent -.->|"web search"| web
-    openai -.->|"reasoning"| agent
-```
+Temporal is used to bring durability to both the content ingestion pipeline and to the agent that leverages the ingested content.
 
 **How to read it:**
 
-1. **A new object lands in object storage** (AWS S3, or MinIO locally).
-2. **The object-created event starts the Temporal `IngestWorkflow` directly** — via an AWS
-   Lambda for real S3, or a MinIO webhook locally. Both call the same handler
-   (`pipeline/lambda_handler.py` / `POST /ingest-event`).
-3. **Temporal** chunks the content, calls **Voyage AI** for embeddings, and upserts into
+1. Changes in **Data Soruces** (S3, RDBMS, messaging technologies, etc.) directly
+    launch workflows running in Temporal
+2. **Temporal** chunks the content, calls **Voyage AI** for embeddings, and upserts into
    **Atlas Search**.
 4. A **durable research agent** (OpenAI Agents SDK, running as a Temporal workflow) answers
    questions over the fresh knowledge, using vector search + rerank (and web search) as tools.
 
-> **Design note:** the direct trigger (Lambda / MinIO webhook → `IngestWorkflow`) leverages 
-> Temporal's durable execution to provide the "don't lose the
-> event once the workflow starts" guarantee. 
+> **Design note:** the direct trigger (i.e. S3 to the Ingestion Workflow) leverages 
+> Temporal's durable execution to provide the "don't lose the event once the workflow starts"
+> guarantee. For those who already have a change data capability wired through Kafka, please see the [tbd]() branch.
 
 ### Division of responsibility
 
@@ -101,49 +75,7 @@ flowchart LR
 
 ## System architecture
 
-```mermaid
-flowchart TB
-    user([User]) --> ui["React UI (:5173)"]
-    minio[("S3 / MinIO")]
-
-    subgraph trig["Trigger · S3 ObjectCreated"]
-      lam["AWS Lambda (prod)"]
-      hook["MinIO webhook →<br/>/ingest-event (local)"]
-    end
-    minio --> lam
-    minio --> hook
-
-    ui -->|"POST /research + poll"| api["Agent API<br/>FastAPI (:8090)"]
-
-    subgraph worker["Temporal worker · queue 'temporal-pipeline'"]
-      iw["IngestWorkflow<br/>fetch → chunk → embed(∥) → index"]
-      bw["BackfillWorkflow<br/>re-embed → knowledge_v2"]
-      da["DeepResearchAgent<br/>OpenAI Agents SDK loop"]
-    end
-
-    lam -->|"start_workflow"| iw
-    hook -->|"start_workflow"| iw
-    api -->|"start + query progress"| da
-
-    subgraph atlas["MongoDB Atlas"]
-      staging[("chunks_staging")]
-      know[("knowledge<br/>+ vector index")]
-      knowv2[("knowledge_v2")]
-      cfg[("temporal_config")]
-    end
-
-    voyage[["Voyage AI<br/>voyage-3.5 + rerank-2.5"]]
-    openai[["OpenAI<br/>agent model + web search"]]
-
-    iw -.->|"embed"| voyage
-    iw -->|"stage"| staging
-    iw -->|"index"| know
-    bw --> knowv2
-    da -.->|"vector_search"| know
-    da -.->|"rerank"| voyage
-    da -.->|"reason + web"| openai
-    da -.->|"active pointer"| cfg
-```
+![System architecture for direct to Temporal ingestion and durable agent](docs/images/mongodb-temporal-architecture-directtotemporal.png)
 
 ### Atlas data model
 
@@ -179,75 +111,9 @@ workflow to completion across retries, worker restarts, and infra maintenance.
 - **Output.** Embedded chunks land in `knowledge` with an Atlas Vector Search index, ready for the
   agent. Internals: `docs/LLD.md` §5–6.
 
-### Ingest workflow
+### Ingestion sequence diagram
 
-```mermaid
-flowchart TB
-    ev(["S3 ObjectCreated event"]) --> trig["Lambda / MinIO webhook<br/>handle_s3_event → start_ingest"]
-    trig -->|"start_workflow · TERMINATE_EXISTING<br/>workflow id = ingest-sha1(s3_uri)  (per object key)"| s1
-
-    subgraph wf["IngestWorkflow (Temporal)"]
-      direction TB
-      s1["Stage 1 · fetch_and_stage_chunks<br/>GET object · doc_content_hash = sha256(bytes) · extract + chunk"]
-      hash{"doc_content_hash<br/>already in knowledge?<br/>(content hash, not the URI hash)"}
-      s2["Stage 2 · embed_staged_chunk<br/>parallel waves of 10"]
-      s3["Stage 3 · index_document<br/>upsert · prune stale · ensure vector index"]
-      s1 --> hash
-      hash -->|"yes — same bytes"| done1(["done · unchanged"])
-      hash -->|"no — new / changed bytes"| s2 --> s3 --> done2(["done · indexed"])
-    end
-
-    s1 -.->|"GET"| store[("S3 / MinIO")]
-    s1 -->|"stage chunks"| staging[("chunks_staging")]
-    s2 -.->|"embed"| voyage[["Voyage voyage-3.5"]]
-    s2 -->|"update"| staging
-    s3 -->|"upsert"| know[("knowledge + vector index")]
-```
-
-> **Two hashes, two jobs.** The **workflow id** hashes the *URI* — `sha1(s3_uri)` — so it's
-> stable per object key: a re-upload reuses the id, and `TERMINATE_EXISTING` replaces any
-> in-flight run. The **dedupe check** hashes the *content* — `doc_content_hash = sha256(bytes)`
-> — so an *edited* file (new bytes) misses the check and is re-embedded, while an *unchanged*
-> re-upload matches and short-circuits.
-
-### Sequence — ingestion
-
-```mermaid
-sequenceDiagram
-    actor Uploader
-    participant Store as S3 / MinIO
-    participant Trig as Trigger (Lambda / webhook)
-    participant WF as IngestWorkflow (Temporal)
-    participant Atlas as MongoDB Atlas
-    participant Voyage
-
-    Uploader->>Store: upload object (key)
-    Store->>Trig: ObjectCreated event
-    Trig->>WF: start_workflow (id = ingest-sha1(uri), TERMINATE_EXISTING)
-    Trig-->>Store: ack (returns immediately)
-
-    Note over WF: Stage 1 · fetch_and_stage_chunks
-    WF->>Store: GET object
-    Store-->>WF: bytes
-    Note over WF: doc_content_hash = sha256(bytes)
-    WF->>Atlas: look up knowledge by doc_id + doc_content_hash
-    alt content unchanged (hash matches)
-        Atlas-->>WF: match found
-        Note over WF: done · unchanged (skip embed + index)
-    else new or changed content
-        Atlas-->>WF: no match
-        WF->>Atlas: insert chunks into chunks_staging
-        Note over WF: Stage 2 · embed_staged_chunk (parallel waves of 10)
-        loop per chunk
-            WF->>Voyage: embed(text)
-            Voyage-->>WF: vector
-            WF->>Atlas: update chunk (status embedded)
-        end
-        Note over WF: Stage 3 · index_document
-        WF->>Atlas: upsert chunks into knowledge · prune stale · ensure vector index
-        Note over WF: done · indexed
-    end
-```
+![Sequence diagram for Temporal-based ingestion](docs/images/mongodb-temporal-ingest-sequence.png)
 
 ---
 
@@ -270,47 +136,7 @@ decides which to call, and how often.
 
 ### Sequence — research query
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant UI as React UI
-    participant API as Agent API
-    participant WF as DeepResearchAgent (Temporal)
-    participant OAI as OpenAI model
-    participant Tools as vector_search / rerank (activities)
-    participant Atlas as MongoDB Atlas
-    participant Voyage
-
-    User->>UI: ask question
-    UI->>API: POST /research {query}
-    API->>WF: start_workflow → workflow_id
-    API-->>UI: {workflow_id}
-
-    loop agent loop (model decides tools)
-        WF->>OAI: model turn (activity, may web-search)
-        OAI-->>WF: tool call(s) or final answer
-        opt retrieve
-            WF->>Tools: vector_search(query)
-            Tools->>Voyage: embed query
-            Tools->>Atlas: $vectorSearch (active collection)
-            Atlas-->>Tools: candidate chunks
-            Tools-->>WF: chunks
-        end
-        opt prioritize
-            WF->>Tools: rerank(chunk_ids)
-            Tools->>Voyage: rerank-2.5
-            Tools-->>WF: top chunks
-        end
-    end
-
-    loop UI polling (~600 ms)
-        UI->>API: GET /research/{id}
-        API->>WF: query "progress"
-        WF-->>API: steps / answer / done
-        API-->>UI: progress
-    end
-    UI-->>User: cited answer + step trace
-```
+![Sequence diagram for Temporal-based agent](docs/images/mongodb-temporal-agent-sequence.png)
 
 ---
 
