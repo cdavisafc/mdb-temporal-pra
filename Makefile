@@ -32,7 +32,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "One-shot:   make start   (infra + temporal + worker + trigger-listener + agent-api)"
+	@echo "One-shot:   make start   (infra + temporal + worker + trigger-api + agent-api)"
 	@echo "Then:       make index (once) ; make seed ; make agent-ui"
 	@echo "Teardown:   make stop"
 
@@ -45,7 +45,7 @@ install: ## Install Python deps with uv
 	uv sync
 
 .env: ## Create .env from the example if missing
-	@test -f .env || (cp .env.example .env && echo "created .env — fill in MONGODB_URI, VOYAGE_API_KEY, ANTHROPIC_API_KEY")
+	@test -f .env || (cp .env.example .env && echo "created .env — fill in MONGODB_URI, VOYAGE_API_KEY, OPENAI_API_KEY")
 
 .PHONY: check-env
 check-env: .env
@@ -59,34 +59,27 @@ setup: check-env install ## Setup Python deps and UI (npm install)
 	@echo "setup complete. Run 'make start' to start all services."
 
 # ---------------------------------------------------------------------------
-# Infra (Confluent Kafka + Kafka Connect + MinIO)
+# Infra (MinIO)
 # ---------------------------------------------------------------------------
 
 # --wait only covers long-running services; the *-setup containers are one-shot (exit 0),
 # which `docker compose up --wait` would otherwise treat as a failure.
 .PHONY: infra-up
-infra-up: .env ## Start Kafka + Connect + MinIO; register sink connector + bucket event
-	@$(COMPOSE) up -d --wait kafka connect minio
+infra-up: .env ## Start MinIO (default local ingress: MinIO webhook -> trigger_api /ingest-event)
+	@$(COMPOSE) up -d --wait minio
 	@$(COMPOSE) up -d minio-setup
-	@echo "registering MongoDB sink connector..."
-	@$(PY) -m infra.register_connector
 
 .PHONY: infra-down
 infra-down: ## Stop infra containers (keep volumes)
 	$(COMPOSE) down
 
 .PHONY: infra-clean
-infra-clean: ## Stop infra and wipe volumes (Kafka + MinIO data)
+infra-clean: ## Stop infra and wipe volumes (MinIO data)
 	$(COMPOSE) down -v
 
 .PHONY: infra-logs
 infra-logs: ## Tail infra container logs
 	$(COMPOSE) logs -f
-
-.PHONY: connector-status
-connector-status: ## Show the MongoDB sink connector status
-	@curl -s $(shell grep -E '^KAFKA_CONNECT_URL=' .env | cut -d= -f2 | sed 's/^$$/http:\/\/localhost:8083/')/connectors/mongo-sink/status | python3 -m json.tool || \
-		curl -s http://localhost:8083/connectors/mongo-sink/status | python3 -m json.tool
 
 .PHONY: index
 index: check-env ## Create Atlas Vector Search index on the active collection
@@ -104,12 +97,8 @@ temporal: ## Run the Temporal dev server (foreground; Web UI :8233)
 worker: check-env ## Run the Temporal worker (foreground)
 	$(PY) -m pipeline.worker
 
-.PHONY: trigger-listen
-trigger-listen: check-env ## Dev shim: watch sources change stream -> start IngestWorkflow
-	$(PY) -m pipeline.trigger_listener
-
 .PHONY: trigger-api
-trigger-api: check-env ## Run the ASP trigger HTTP endpoint (what ASP $https calls)
+trigger-api: check-env ## Run the trigger HTTP endpoint (MinIO webhook -> /ingest-event; manual /ingest-trigger)
 	$(PY) -m pipeline.trigger_api
 
 .PHONY: agent-api
@@ -125,7 +114,7 @@ agent-ui: ## Run the React (Vite) deep-agent UI
 # ---------------------------------------------------------------------------
 
 .PHONY: start
-start: install .env infra-up ## Start everything in the background (infra + temporal + worker + trigger-listener + agent-api + agent-ui)
+start: install .env infra-up ## Start everything in the background (NO_WORKER=1 skips the worker so you can run 'make worker' in the foreground)
 	@mkdir -p $(LOGDIR)
 	@if bash -c 'exec 3<>/dev/tcp/127.0.0.1/7233' 2>/dev/null; then \
 		echo "temporal: already running on :7233 — reusing it"; \
@@ -134,8 +123,12 @@ start: install .env infra-up ## Start everything in the background (infra + temp
 		nohup temporal server start-dev > $(LOGDIR)/temporal.log 2>&1 & echo $$! > $(LOGDIR)/temporal.pid; \
 		until bash -c 'exec 3<>/dev/tcp/127.0.0.1/7233' 2>/dev/null; do sleep 0.5; done; \
 	fi
-	@$(MAKE) -s _bg NAME=worker CMD="$(PY) -u -m pipeline.worker"
-	@$(MAKE) -s _bg NAME=trigger-listener CMD="$(PY) -u -m pipeline.trigger_listener"
+	@if [ -n "$(NO_WORKER)" ]; then \
+		echo "worker: SKIPPED (NO_WORKER set) — run it yourself in a foreground terminal: make worker"; \
+	else \
+		$(MAKE) -s _bg NAME=worker CMD="$(PY) -u -m pipeline.worker"; \
+	fi
+	@$(MAKE) -s _bg NAME=trigger-api CMD="$(PY) -u -m pipeline.trigger_api"
 	@$(MAKE) -s _bg NAME=agent-api CMD="$(PY) -u -m agent.api"
 	@if [ ! -d agent/ui/node_modules ]; then \
 		echo "agent-ui: installing npm dependencies"; \
@@ -144,7 +137,8 @@ start: install .env infra-up ## Start everything in the background (infra + temp
 	@$(MAKE) -s _bg NAME=agent-ui CMD="npm --prefix agent/ui run dev -- --host 0.0.0.0"
 	@sleep 2
 	@echo
-	@echo "started. Temporal UI: http://localhost:8233 | Agent UI: http://localhost:5173 | MinIO: http://localhost:9001 | Connect: http://localhost:8083"
+	@echo "started. Temporal UI: http://localhost:8233 | Agent UI: http://localhost:5173 | MinIO: http://localhost:9001 | Trigger API: http://localhost:8088"
+	@if [ -n "$(NO_WORKER)" ]; then echo "NOTE: worker NOT started — run 'make worker' in a separate foreground terminal (kill it mid-ingest to demo durability)"; fi
 	@echo "next: 'make index' (once) ; 'make seed'"
 	@echo "logs: 'make app-logs'   stop: 'make stop'"
 
@@ -163,11 +157,11 @@ stop: stop-app ## Stop background app processes, Temporal, and infra
 	@$(COMPOSE) down
 
 .PHONY: stop-app
-stop-app: ## Stop worker + trigger-listener + agent-api + agent-ui (leaves Temporal + infra up)
-	@-for pat in pipeline.worker pipeline.trigger_listener agent.api "agent/ui.*vite"; do \
+stop-app: ## Stop worker + trigger-api + agent-api + agent-ui (leaves Temporal + infra up)
+	@-for pat in pipeline.worker pipeline.trigger_api agent.api "agent/ui.*vite"; do \
 		pkill -f "$$pat" 2>/dev/null && echo "stopped $$pat" || true; \
 	done
-	@-for p in worker trigger-listener agent-api agent-ui; do \
+	@-for p in worker trigger-api agent-api agent-ui; do \
 		if [ -f $(LOGDIR)/$$p.pid ]; then kill $$(cat $(LOGDIR)/$$p.pid) 2>/dev/null || true; rm -f $(LOGDIR)/$$p.pid; fi; \
 	done
 
@@ -176,7 +170,7 @@ restart-app: stop-app ## Restart app processes (e.g. after editing .env) — lea
 	@mkdir -p $(LOGDIR)
 	@sleep 1
 	@$(MAKE) -s _bg NAME=worker CMD="$(PY) -u -m pipeline.worker"
-	@$(MAKE) -s _bg NAME=trigger-listener CMD="$(PY) -u -m pipeline.trigger_listener"
+	@$(MAKE) -s _bg NAME=trigger-api CMD="$(PY) -u -m pipeline.trigger_api"
 	@$(MAKE) -s _bg NAME=agent-api CMD="$(PY) -u -m agent.api"
 	@if [ ! -d agent/ui/node_modules ]; then \
 		echo "agent-ui: installing npm dependencies"; \
@@ -187,8 +181,8 @@ restart-app: stop-app ## Restart app processes (e.g. after editing .env) — lea
 	@echo "restarted app processes with current .env"
 
 .PHONY: app-logs
-app-logs: ## Tail worker + trigger-listener + agent-api + agent-ui + temporal logs
-	@tail -n +1 -f $(LOGDIR)/worker.log $(LOGDIR)/trigger-listener.log $(LOGDIR)/agent-api.log $(LOGDIR)/agent-ui.log $(LOGDIR)/temporal.log 2>/dev/null
+app-logs: ## Tail worker + trigger-api + agent-api + agent-ui + temporal logs
+	@tail -n +1 -f $(LOGDIR)/worker.log $(LOGDIR)/trigger-api.log $(LOGDIR)/agent-api.log $(LOGDIR)/agent-ui.log $(LOGDIR)/temporal.log 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # Drive the pipeline
