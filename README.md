@@ -26,18 +26,16 @@ In this architecture Temporal owns two critical concerns:
 
 ## The problem this solves
 
-Customers hand-roll resilient ingestion/embedding pipelines and it hurts
-(source: [MongoDB × Temporal proposal](https://docs.google.com/document/d/1pReiGwWCwFj28nWsZ6NiCA9nWrqhcaWgF51s_odUeCs/edit?tab=t.0#heading=h.54b4x1c9rtcf)):
+Customers hand-roll resilient ingestion/embedding pipelines and it hurts:
 
-| Customer     | Pain hand-rolled without Temporal                                        |
-| ------------ | ------------------------------------------------------------------------ |
-| Regilient AI | MD5 change-tracking in production to decide what to re-embed             |
-| Glassdoor    | A homegrown "lambda clock" cron to generate embeddings                   |
-| Carrier      | A FastAPI pipeline, hand-tuning sequential vs. parallel                  |
-| Emerald X    | A 5-hour import that fails on the last step **reruns the entire import** |
+| Customer   | Pain hand-rolled without Temporal                                        |
+| ---------- | ------------------------------------------------------------------------ |
+| Customer A | MD5 change-tracking in production to decide what to re-embed             |
+| Customer B | A homegrown "lambda clock" cron to generate embeddings                   |
+| Customer C | A FastAPI pipeline, hand-tuning sequential vs. parallel                  |
+| Customer D | A 5-hour import that fails on the last step **reruns the entire import** |
 
-This PRA packages the pattern that removes that pain — already in production at DEA Technology,
-100ms, Chess.com, and C.R. England.
+This PRA packages the pattern that removes that pain — already in production at multiple enterprise customers.
 
 ---
 
@@ -52,23 +50,23 @@ Temporal is used to bring durability to both the content ingestion pipeline and 
 **How to read it:**
 
 1. Changes in **Data Soruces** (S3, RDBMS, messaging technologies, etc.) directly
-    launch workflows running in Temporal
+   launch workflows running in Temporal
 2. **Temporal** chunks the content, calls **Voyage AI** for embeddings, and upserts into
    **Atlas Search**.
-4. A **durable research agent** (OpenAI Agents SDK, running as a Temporal workflow) answers
+3. A **durable research agent** (OpenAI Agents SDK, running as a Temporal workflow) answers
    questions over the fresh knowledge, using vector search + rerank (and web search) as tools.
 
-> **Design note:** the direct trigger (i.e. S3 to the Ingestion Workflow) leverages 
+> **Design note:** the direct trigger (i.e. S3 to the Ingestion Workflow) leverages
 > Temporal's durable execution to provide the "don't lose the event once the workflow starts"
-> guarantee. For those who already have a change data capability wired through Kafka, please see the [tbd]() branch.
+> guarantee. For those who already have a change data capability wired through Kafka, please see [this](https://github.com/mongodb-partners/mdb-temporal-pra/tree/with-kafka) branch.
 
 ### Division of responsibility
 
-| Concern                                                       | Owner                 |
-| ------------------------------------------------------------- | --------------------- |
-| Orchestration, retries, checkpointing, backfill, resumability | **Temporal**          |
-| Operational data, vector index, agent memory & state          | **MongoDB Atlas**     |
-| Embeddings & reranking                                        | **MongoDB Voyage AI** |
+| Concern                                                       | Owner                   |
+| ------------------------------------------------------------- | ----------------------- |
+| Orchestration, retries, checkpointing, backfill, resumability | **Temporal**            |
+| Operational data, vector index, agent memory & state          | **MongoDB Atlas**       |
+| Embeddings & reranking                                        | **MongoDB Voyage AI**   |
 | Agent reasoning & answers                                     | **OpenAI (Agents SDK)** |
 
 ---
@@ -101,7 +99,7 @@ directly (an AWS Lambda in production, a MinIO webhook locally — both through 
 `handle_s3_event`). The moment `start_workflow` returns, the change is safe: Temporal runs the
 workflow to completion across retries, worker restarts, and infra maintenance.
 
-- **Trigger goes directly to Temporal** Temporal's durable execution provides the "don't lose the 
+- **Trigger goes directly to Temporal** Temporal's durable execution provides the "don't lose the
   event" guarantee; the trigger is a thin adapter (`pipeline/lambda_handler.py` /
   `POST /ingest-event`).
 - **Idempotent, update-in-place.** A content-hash check skips re-embedding unchanged objects; an
@@ -126,7 +124,7 @@ decides which to call, and how often.
 
 - **Tools.** `vector_search` and `rerank` are Temporal activities over Atlas + Voyage, plus a
   hosted **web search** to supplement the corpus.
-- **Durable & auditable.** The reasoning loop *is* a workflow, so every model and tool call is a
+- **Durable & auditable.** The reasoning loop _is_ a workflow, so every model and tool call is a
   history event — resumable after a crash and fully inspectable in the Temporal UI.
 - **Live progress.** Run hooks record human-readable steps; the UI starts the run
   (`POST /research`) and polls a workflow `query` (`GET /research/{id}`) to show the trace as it
@@ -142,10 +140,12 @@ decides which to call, and how often.
 
 ## Quickstart (local demo)
 
+**Prerequisites:** `uv`, Docker, Temporal CLI, and Node 20+ — see [docs/RUNBOOK.md → Prerequisites](docs/RUNBOOK.md#prerequisites) for install commands.
+
 ```bash
 # 1. Clone and enter the repo
-git clone https://github.com/suresharam/mongodb-temporal-sa-pra.git
-cd mongodb-temporal-sa-pra
+git clone https://github.com/mongodb-partners/mdb-temporal-pra.git
+cd mdb-temporal-pra
 
 # 2. Copy and fill in credentials
 cp .env.example .env
@@ -172,20 +172,20 @@ make stop
 
 `make help` lists all available targets.
 
-| Service           | URL                   | Login                                          |
-| ----------------- | --------------------- | ---------------------------------------------- |
-| Agent chat UI     | http://localhost:5173 |                                                |
-| Temporal Web UI   | http://localhost:8233 |                                                |
-| Agent API         | http://localhost:8090 |                                                |
-| MinIO console     | http://localhost:9001 | username: `minioadmin`, password: `minioadmin` |
-| Trigger API       | http://localhost:8088 | webhook `/ingest-event` (default local trigger) |
+| Service         | URL                   | Login                                           |
+| --------------- | --------------------- | ----------------------------------------------- |
+| Agent chat UI   | http://localhost:5173 |                                                 |
+| Temporal Web UI | http://localhost:8233 |                                                 |
+| Agent API       | http://localhost:8090 |                                                 |
+| MinIO console   | http://localhost:9001 | username: `minioadmin`, password: `minioadmin`  |
+| Trigger API     | http://localhost:8088 | webhook `/ingest-event` (default local trigger) |
 
 ---
 
 ## Repo layout
 
 ```text
-mongodb-temporal-sa-pra/
+mdb-temporal-pra/
 ├── README.md
 ├── Makefile                        ← all dev commands (make help)
 ├── pyproject.toml                  ← Python deps managed by uv
@@ -219,9 +219,9 @@ mongodb-temporal-sa-pra/
 
 ## Developer guide
 
-| Document                               | Description                                                                                       |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | Prerequisites, API key setup, local spin-up, cloud infra references                               |
-| **[docs/LLD.md](docs/LLD.md)**         | Low-level design — data contracts, workflow internals, scaling to multiple sources and data types |
-| **[docs/agent-retrieval.md](docs/agent-retrieval.md)** | The deep agent — retrieval, rerank, synthesis, and how it ties to the vector store |
-| **[docs/decisions/](docs/decisions/)** | Architecture Decision Records — e.g. ADR 0001 (direct-from-S3 triggering)                          |
+| Document                                               | Description                                                                                       |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| **[docs/RUNBOOK.md](docs/RUNBOOK.md)**                 | Prerequisites, API key setup, local spin-up, cloud infra references                               |
+| **[docs/LLD.md](docs/LLD.md)**                         | Low-level design — data contracts, workflow internals, scaling to multiple sources and data types |
+| **[docs/agent-retrieval.md](docs/agent-retrieval.md)** | The deep agent — retrieval, rerank, synthesis, and how it ties to the vector store                |
+| **[docs/decisions/](docs/decisions/)**                 | Architecture Decision Records — e.g. ADR 0001 (direct-from-S3 triggering)                         |
