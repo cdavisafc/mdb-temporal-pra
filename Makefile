@@ -114,7 +114,7 @@ agent-ui: ## Run the React (Vite) deep-agent UI
 # ---------------------------------------------------------------------------
 
 .PHONY: start
-start: install .env infra-up ## Start everything in the background (infra + temporal + worker + trigger-api + agent-api + agent-ui)
+start: install .env infra-up ## Start everything in the background (NO_WORKER=1 skips the worker so you can run 'make worker' in the foreground)
 	@mkdir -p $(LOGDIR)
 	@if bash -c 'exec 3<>/dev/tcp/127.0.0.1/7233' 2>/dev/null; then \
 		echo "temporal: already running on :7233 — reusing it"; \
@@ -123,7 +123,11 @@ start: install .env infra-up ## Start everything in the background (infra + temp
 		nohup temporal server start-dev > $(LOGDIR)/temporal.log 2>&1 & echo $$! > $(LOGDIR)/temporal.pid; \
 		until bash -c 'exec 3<>/dev/tcp/127.0.0.1/7233' 2>/dev/null; do sleep 0.5; done; \
 	fi
-	@$(MAKE) -s _bg NAME=worker CMD="$(PY) -u -m pipeline.worker"
+	@if [ -n "$(NO_WORKER)" ]; then \
+		echo "worker: SKIPPED (NO_WORKER set) — run it yourself in a foreground terminal: make worker"; \
+	else \
+		$(MAKE) -s _bg NAME=worker CMD="$(PY) -u -m pipeline.worker"; \
+	fi
 	@$(MAKE) -s _bg NAME=trigger-api CMD="$(PY) -u -m pipeline.trigger_api"
 	@$(MAKE) -s _bg NAME=agent-api CMD="$(PY) -u -m agent.api"
 	@if [ ! -d agent/ui/node_modules ]; then \
@@ -134,6 +138,7 @@ start: install .env infra-up ## Start everything in the background (infra + temp
 	@sleep 2
 	@echo
 	@echo "started. Temporal UI: http://localhost:8233 | Agent UI: http://localhost:5173 | MinIO: http://localhost:9001 | Trigger API: http://localhost:8088"
+	@if [ -n "$(NO_WORKER)" ]; then echo "NOTE: worker NOT started — run 'make worker' in a separate foreground terminal (kill it mid-ingest to demo durability)"; fi
 	@echo "next: 'make index' (once) ; 'make seed'"
 	@echo "logs: 'make app-logs'   stop: 'make stop'"
 
